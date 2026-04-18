@@ -1,0 +1,20 @@
+file_name,pmid,pmc,section,subsection,focus,document_type,clinical_scope,priority,status,notes
+2019_acute_gvhd_review_brief-review.pdf,31475512,,diagnosis,acute,diagnosis,review,acute,secondary,downloaded,Disponible en data/01_diagnosis/acute
+2023_acute_gvhd_review_acute-graft-versus-host-disease.pdf,37291149,,diagnosis,acute,diagnosis,review,acute,principal,pending_access,Validado pero no descargado
+2022_chronic_gvhd_review_clinical-manifestations-part1.pdf,36572065,,diagnosis,chronic,manifestations,review,chronic,principal,downloaded,Disponible en data/01_diagnosis/chronic
+2022_chronic_gvhd_review_disease-activity-part2.pdf,36572064,,diagnosis,chronic,grading,review,chronic,secondary,downloaded,Disponible en data/01_diagnosis/chronic
+2000_gastrointestinal_review_manifestations-diagnosis-management.pdf,10865534,,organs,gastrointestinal,manifestations,review,mixed,principal,pending_access,Validado pero no descargado
+2000_gastrointestinal_review_diagnosis.pdf,11095315,,organs,gastrointestinal,diagnosis,review,mixed,secondary,pending_access,Validado pero no descargado
+2018_skin_review_cutaneous-gvhd.pdf,29344728,,organs,skin,manifestations,review,mixed,principal,downloaded,Disponible en data/02_organs/skin
+2024_skin_review_cutaneous-chronic-gvhd.pdf,39370234,,organs,skin,manifestations,review,chronic,secondary,downloaded,Disponible en data/02_organs/skin
+2016_liver_review_liver-gvhd-diagnosis.pdf,27352436,,organs,liver,diagnosis,review,mixed,principal,downloaded,Disponible en data/02_organs/liver
+2016_liver_review_hepatic-gvhd-differential.pdf,,PMC4783620,organs,liver,differential_diagnosis,review,mixed,secondary,downloaded,Disponible en data/02_organs/liver
+2014_oral_review_oral-gvhd.pdf,24655527,,organs,oral,manifestations,review,chronic,principal,pending_access,Validado pero no descargado
+2023_ocular_review_from-a-to-z.pdf,36870423,,organs,ocular,manifestations,review,mixed,principal,downloaded,Disponible en data/02_organs/ocular
+2021_ocular_review_clinical-presentation.pdf,34228599,,organs,ocular,clinical_presentation,review,mixed,secondary,pending_access,Validado pero no descargado
+2022_pulmonary_review_bronchiolitis-obliterans-syndrome.pdf,35898810,,organs,pulmonary,manifestations,review,mixed,principal,downloaded,Disponible en data/02_organs/pulmonary
+2015_pulmonary_review_obliterative-bronchiolitis.pdf,26335918,,organs,pulmonary,manifestations,review,mixed,secondary,pending_access,Validado pero no descargado
+2012_musculoskeletal_review_fibrotic-sclerotic-manifestations.pdf,22226112,,organs,musculoskeletal,manifestations,review,chronic,principal,downloaded,Disponible en data/02_organs/musculoskeletal
+2019_genital_review_female-genital-tract-chronic-gvhd.pdf,30793107,,organs,genital,manifestations,review,chronic,principal,downloaded,Disponible en data/02_organs/genital; genital masculino no separado por falta de literatura equivalente
+2017_genital_review_vulvovaginal-gvhd.pdf,28778644,,organs,genital,manifestations,review,chronic,secondary,pending_access,Validado pero no descargado
+2024_crosscutting_review_skin-hair-musculoskeletal-complications.pdf,39437039,,cross_cutting,skin_hair_musculoskeletal,manifestations,review,chronic,support,pending_access,Refuerzo transversal validado pero no descargado
