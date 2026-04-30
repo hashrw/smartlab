@@ -11,30 +11,46 @@ from schemas import (
 )
 
 ALIAS_QUERY_MAP = {
+    "o1_diarrea_acuosa": "watery diarrhea",
     "o1_diarrea_con_sangre": "bloody diarrhea",
     "o1_dolor_abdominal": "abdominal pain",
     "o1_nauseas": "nausea",
     "o1_vomitos": "vomiting",
+    "o1_anorexia": "anorexia",
     "o2_alt_elevada": "elevated ALT",
     "o2_fosfatasa_alcalina_elevada": "elevated alkaline phosphatase",
     "o2_hiperbilirrubinemia": "hyperbilirubinemia",
+    "o7_exantema_maculopapular": "maculopapular rash",
 }
 
 ORGAN_QUERY_MAP = {
     "Hígado": "liver",
+    "Higado": "liver",
     "Tracto gastrointestinal": "gastrointestinal tract",
     "Piel": "skin",
-    "Ojos": "eyes",
-    "Boca": "mouth",
-    "Pulmones": "lungs",
+    "Ojos": "ocular",
+    "Boca": "oral",
+    "Pulmón": "pulmonary",
+    "Pulmon": "pulmonary",
+    "Pulmones": "pulmonary",
 }
 
 app = Flask(__name__)
 
-# Instancia única al arrancar la app, no en cada request.
-# La salida activa del sistema queda fijada en Opción B,
-# aunque Opción A sigue siendo la base interna del retrieval.
-rag = RAGService(default_mode="option_b")
+# Instancia única al arrancar la app.
+# En integración Laravel se usa una query clínica ya generada desde el DSS.
+# integration_mode=True evita el modo pesado de multiquery usado en pruebas T01-T05.
+rag = RAGService(
+    data_dir="data/core",
+    default_mode="option_b",
+    integration_mode=True,
+    debug=False,
+    similarity_top_k=8,
+    use_hybrid=True,
+    use_cross_encoder=True,
+    llm_timeout_seconds=120,
+    llm_max_context_sentences=3,
+)
 
 
 def iso_now() -> str:
@@ -48,33 +64,36 @@ def iso_now() -> str:
 
 def build_query(caso: dict) -> str:
     """
-    Construye una query bibliográfica inicial a partir del caso clínico.
+    Construye una query de respaldo a partir del caso clínico.
 
-    Nota:
-    - Esta query sigue siendo útil para el retrieval bibliográfico.
-    - En la siguiente fase, el SQL connector añadirá contexto estructurado
-      del paciente y esta función quedará como una pieza más del contexto global,
-      no como única fuente de señal.
+    En el flujo final Laravel envía una query dinámica completa.
+    Esta función queda como error técnico si la petición no lleva query.
     """
     sintomas = caso.get("active_aliases_canonical", [])
     organos = caso.get("organo_score_nih_by_nombre", {})
 
     mapped_terms = [
-        ALIAS_QUERY_MAP.get(alias, alias.replace("_", " ")) for alias in sintomas[:4]
+        ALIAS_QUERY_MAP.get(alias, alias.replace("_", " ")) for alias in sintomas[:6]
     ]
 
-    organ_terms = [ORGAN_QUERY_MAP.get(org, org) for org in list(organos.keys())[:2]]
+    organ_terms = [ORGAN_QUERY_MAP.get(org, org) for org in list(organos.keys())[:3]]
 
-    base_terms = mapped_terms + organ_terms + ["graft versus host disease", "GVHD"]
+    score_terms = []
+    for org, score in list(organos.items())[:3]:
+        organ_name = ORGAN_QUERY_MAP.get(org, org)
+        score_terms.append(f"{organ_name} NIH score {score}")
 
-    return " ".join(base_terms).strip()
+    base_terms = (
+        mapped_terms
+        + organ_terms
+        + score_terms
+        + ["graft versus host disease", "GVHD", "clinical evidence"]
+    )
+
+    return " ".join(term for term in base_terms if term).strip()
 
 
 def build_citations_from_sources(sources: list[dict]) -> list[dict]:
-    """
-    Convierte las sources del RAG a una estructura de citas compatible
-    con la respuesta del endpoint.
-    """
     citations = []
 
     for source in sources:
@@ -96,18 +115,10 @@ def build_citations_from_sources(sources: list[dict]) -> list[dict]:
 
 
 def build_evidence_map(citations: list[dict]) -> list[dict]:
-    """
-    Mapa simple de evidencia para mantener compatibilidad con el contrato actual.
-
-    Nota:
-    - Sigue siendo una capa ligera.
-    - Se podrá enriquecer más adelante cuando entre el SQL connector
-      y exista contexto mixto bibliográfico + clínico estructurado.
-    """
     if not citations:
         return []
 
-    titles = [c.get("title") for c in citations if c.get("title")]
+    titles = [citation.get("title") for citation in citations if citation.get("title")]
 
     return [
         {
@@ -125,12 +136,24 @@ def evidence():
         validated = validate_evidence_request(data)
 
         caso = validated.get("caso_clinico", {}) if isinstance(validated, dict) else {}
+        paciente_id = caso.get("paciente_id")
+        resultado_inferencia = (
+            validated.get("resultado_inferencia", {})
+            if isinstance(validated, dict)
+            else {}
+        )
 
-        query = data.get("query") or build_query(caso) or "Analyze the clinical case"
+        query = (
+            validated.get("query")
+            or build_query(caso)
+            or "Analyze the clinical case for graft versus host disease evidence"
+        )
 
-        # Opción B queda explícita como salida activa del sistema.
-        # Opción A sigue usándose internamente como base del retrieval.
-        rag_result = rag.query(query, mode="option_b")
+        rag_result = rag.generate_clinical_report(
+            caso_clinico=caso,
+            resultado_inferencia=resultado_inferencia,
+            paciente_id=paciente_id,
+        )
 
         sources = rag_result.get("sources", [])
         citations = build_citations_from_sources(sources)
@@ -144,6 +167,9 @@ def evidence():
                 "generated_query": query,
                 "mode": rag_result.get("mode", "option_b"),
                 "llm_used": rag_result.get("llm_used", False),
+                "llm_model": rag_result.get("llm_model"),
+                "paciente_id": paciente_id,
+                "fallback_reason": rag_result.get("fallback_reason"),
                 "timestamp": iso_now(),
             },
             generated_at=iso_now(),
@@ -151,12 +177,12 @@ def evidence():
 
         return jsonify(response), 200
 
-    except Exception as e:
+    except Exception as exc:
         return (
             jsonify(
                 build_error_response(
                     code="EVIDENCE_ERROR",
-                    message=str(e),
+                    message=str(exc),
                     api_version=API_VERSION,
                 )
             ),
@@ -164,6 +190,52 @@ def evidence():
         )
 
 
+@app.route("/clinical-report", methods=["POST"])
+def clinical_report():
+    data = request.get_json(silent=True) or {}
+
+    try:
+        validated = validate_evidence_request(data)
+
+        caso = validated.get("caso_clinico", {}) if isinstance(validated, dict) else {}
+        paciente_id = caso.get("paciente_id")
+
+        rag_result = rag.generate_clinical_report(
+            caso_clinico=caso,
+            paciente_id=paciente_id,
+        )
+
+        response = {
+            "api_version": API_VERSION,
+            "status": "ok",
+            "generated_at": iso_now(),
+            "clinical_report": rag_result.get("clinical_report", {}),
+            "traceability": {
+                "sources": build_citations_from_sources(rag_result.get("sources", [])),
+                "warnings": rag_result.get("warnings", []),
+                "llm_used": rag_result.get("llm_used", False),
+                "llm_model": rag_result.get("llm_model"),
+                "fallback_reason": rag_result.get("fallback_reason"),
+                "paciente_id": paciente_id,
+            },
+        }
+
+        return jsonify(response), 200
+
+    except Exception as exc:
+        return (
+            jsonify(
+                build_error_response(
+                    code="CLINICAL_REPORT_ERROR",
+                    message=str(exc),
+                    api_version=API_VERSION,
+                )
+            ),
+            500,
+        )
+
+
+# endpoint para comprobar que el servicio esté levantado
 @app.get("/health")
 def health():
     return (
@@ -173,6 +245,7 @@ def health():
                 "status": "ok",
                 "api_version": API_VERSION,
                 "rag_default_mode": "option_b",
+                "integration_mode": True,
             }
         ),
         200,
