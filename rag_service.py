@@ -861,67 +861,85 @@ class RAGService:
         )
 
         return f"""
-                You are a clinical assistant specialized in graft-versus-host disease.
+            You are a clinical assistant specialized in graft-versus-host disease.
 
-                You receive a structured clinical case in Spanish from a deterministic expert system built in Laravel.
+            You receive:
+            1. A structured clinical case in Spanish from Laravel.
+            2. A deterministic DSS inference result from Laravel.
+            3. Literature context retrieved from a local scientific corpus in English.
 
-                Your task:
-                    - Interpret the Spanish clinical JSON.
-                    - Internally translate relevant clinical terms into English when reasoning over the English literature context.
-                    - Use ONLY the provided literature context as scientific support.
-                    - Generate the final answer in Spanish.
-                    - Produce a structured clinical report for a physician.
-                    - Do not invent data.
-                    - Do not diagnose beyond the clinical case and the provided evidence.
-                    - If the evidence is insufficient, state it clearly.
-                    - The report must help the physician validate the case faster, not replace medical judgement.
+            Your role:
+                - Generate a structured clinical validation report for a physician.
+                - The DSS inference is the starting clinical hypothesis.
+                - The RAG evidence supports, qualifies, or limits that hypothesis.
+                - Do not replace medical judgement.
+                - Do not create a new diagnosis independently from the DSS result.
+                - Do not invent symptoms, scores, tests, treatments, or sources.
+                - Use ONLY the provided clinical case, DSS result, and literature context.
+                - Internally translate Spanish clinical terms into English when comparing with the literature.
+                - Return the final report in Spanish.
+                - Be clinically useful, concise, and structured.
+                - Avoid generic explanations.
+                - Focus on organ involvement, severity, warning signs, and validation needs.
 
-            Return ONLY valid JSON.
-            Do not use markdown.
-            Do not add text outside the JSON.
-            Keep the JSON concise. Use short clinical sentences. Do not produce long paragraphs.
+                Important clinical constraints:
+                    - If the case includes NIH organ scores, use them as severity/context indicators.
+                    - If gastrointestinal and liver involvement coexist, highlight multi-organ involvement.
+                    - If the DSS result indicates severe disease, reflect clinical urgency without overstating certainty.
+                    - If evidence is partial or indirect, state it clearly.
+                    - If the literature context mentions differential diagnosis or diagnostic uncertainty, include it as a limitation or validation point.
+                    - Do not recommend treatment unless it is explicitly present in the provided context.
+                    - Do not state that the diagnosis is confirmed unless the provided case includes confirmatory evidence.
 
-            Required JSON structure:
+                Return ONLY valid JSON.
+                Do not use markdown.
+                Do not add text outside the JSON.
+                Use short clinical sentences.
+                Do not produce long paragraphs.
+                Use empty arrays when there is no information.
+                Use null when a scalar value is unknown.
 
-            {{
-                "titulo": "",
-                "resumen_ejecutivo": "",
-                "diagnostico_dss": {
-                "tipo_enfermedad": "",
-                "grado_eich": "",
-                "estado_injerto": "",
-                "regla_aplicada": "",
-                "interpretacion": ""
-            },
-                "justificacion_clinica": [
-            {
-                "organo": "",
-                "score_nih": null,
-                "hallazgos_del_caso": [],
-                "relacion_con_eich": "",
-                "nivel_alerta": "bajo | moderado | alto"
-            }
-            ],
-                "evidencia_cientifica": {
-                "resumen": "",
-                "coherencia_con_el_caso": "",
-                "incertidumbres": []
-            },
-                "alertas_clinicas": [],
-                "limitaciones": [],
-                "validacion_medica_recomendada": [],
-                "conclusion": ""
-            }}
+                Required JSON structure:
 
-            Clinical case JSON:
-            {case_json}
+                {{
+                    "titulo": "Informe clínico DSS-RAG para validación médica",
+                    "resumen_ejecutivo": "",
+                    "diagnostico_dss": {{
+                    "tipo_enfermedad": "",
+                    "grado_eich": "",
+                    "estado_injerto": "",
+                    "regla_aplicada": "",
+                    "interpretacion": ""
+                    }},
+                    "justificacion_clinica": [
+                    {{
+                    "organo": "",
+                    "score_nih": null,
+                    "hallazgos_del_caso": [],
+                    "relacion_con_eich": "",
+                    "nivel_alerta": "bajo"
+                    }}
+                    ],
+                    "evidencia_cientifica": {{
+                    "resumen": "",
+                    "coherencia_con_el_caso": "",
+                    "incertidumbres": []
+                    }},
+                    "alertas_clinicas": [],
+                    "limitaciones": [],
+                    "validacion_medica_recomendada": [],
+                    "conclusion": ""
+                }}
 
-            Literature context:
-            {literature_context}
+                Clinical case JSON:
+                {case_json}
 
-            Deterministic DSS inference result:
-            {inference_json}
-            """
+                Deterministic DSS inference result:
+                {inference_json}
+
+                Literature context:
+                {literature_context}
+                """
 
     def _parse_clinical_report_json(self, llm_answer: str) -> Dict[str, Any]:
         """
