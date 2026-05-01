@@ -963,6 +963,7 @@ class RAGService:
 
         return parsed
 
+    # fallback_clinical_report
     def _fallback_clinical_report(
         self,
         caso_clinico: Dict[str, Any],
@@ -970,21 +971,56 @@ class RAGService:
     ) -> Dict[str, Any]:
         """
         Informe mínimo controlado si falla el LLM o no hay contexto suficiente.
+        Compatible con la estructura nueva del informe clínico DSS-RAG.
         """
+        organos = caso_clinico.get("organo_score_nih_by_nombre", {}) or {}
+        sintomas = caso_clinico.get("active_aliases_canonical", []) or []
+
+        justificacion_clinica = []
+
+        for organo, score in organos.items():
+            nivel_alerta = "alto" if int(score or 0) >= 2 else "moderado"
+
+            justificacion_clinica.append(
+                {
+                    "organo": organo,
+                    "score_nih": score,
+                    "hallazgos_del_caso": sintomas,
+                    "relacion_con_eich": "El órgano presenta afectación registrada en el caso clínico. El informe completo no pudo generarse por fallo del LLM.",
+                    "nivel_alerta": nivel_alerta,
+                }
+            )
+
         return {
-            "titulo": "Informe clínico de apoyo DSS-RAG",
-            "resumen_clinico": "No se ha podido generar un informe clínico completo con el contexto disponible.",
-            "sospecha_diagnostica": None,
-            "organos_afectados": [],
-            "hallazgos_relevantes": [],
-            "evidencia_clinica_resumida": None,
+            "titulo": "Informe clínico DSS-RAG para validación médica",
+            "resumen_ejecutivo": "No se ha podido generar el informe completo mediante LLM. Se muestra un informe mínimo basado en el caso clínico estructurado enviado por el sistema experto.",
+            "diagnostico_dss": {
+                "tipo_enfermedad": None,
+                "grado_eich": None,
+                "estado_injerto": None,
+                "regla_aplicada": None,
+                "interpretacion": "El DSS ha generado un caso clínico estructurado, pero la capa inteligente no ha podido completar la síntesis clínica.",
+            },
+            "justificacion_clinica": justificacion_clinica,
+            "evidencia_cientifica": {
+                "resumen": None,
+                "coherencia_con_el_caso": None,
+                "incertidumbres": [
+                    "No se ha podido completar la generación del informe con LLM.",
+                ],
+            },
+            "alertas_clinicas": [
+                "Revisar manualmente el diagnóstico inferido y los scores NIH asociados.",
+            ],
             "limitaciones": [
                 reason,
             ],
-            "recomendaciones_validacion_medica": [
-                "Validar manualmente el caso clínico desde la información estructurada disponible en el sistema experto.",
+            "validacion_medica_recomendada": [
+                "Validar manualmente el caso clínico desde la información estructurada disponible.",
+                "Revisar síntomas activos y scores NIH por órgano.",
+                "Reintentar la generación del informe si el servicio LLM vuelve a estar disponible.",
             ],
-            "conclusion": "Informe generado en modo fallback controlado.",
+            "conclusion": "Informe generado en modo fallback controlado. No debe considerarse informe clínico completo.",
         }
 
     def debug_query(self, query: str) -> None:
