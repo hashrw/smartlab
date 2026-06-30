@@ -37,18 +37,19 @@ ORGAN_QUERY_MAP = {
 app = Flask(__name__)
 
 # Instancia única al arrancar la app.
-# En integración Laravel se usa una query clínica ya generada desde el DSS.
+# En integración Laravel se usa una query clínica ya generada desde web.
 # integration_mode=True evita el modo pesado de multiquery usado en pruebas T01-T05.
 rag = RAGService(
     data_dir="data/core",
     default_mode="option_b",
     integration_mode=True,
-    debug=False,
+    debug=True,
     similarity_top_k=8,
     use_hybrid=True,
     use_cross_encoder=True,
-    llm_timeout_seconds=120,
+    llm_timeout_seconds=240,
     llm_max_context_sentences=3,
+    capture_logs=False,
 )
 
 
@@ -191,44 +192,55 @@ def evidence():
 
 @app.route("/clinical-report", methods=["POST"])
 def clinical_report():
-    data = request.get_json(silent=True) or {}
-
     try:
-        validated = validate_evidence_request(data)
+        payload = request.get_json(silent=True)
 
-        caso = validated.get("caso_clinico", {}) if isinstance(validated, dict) else {}
-        paciente_id = caso.get("paciente_id")
+        if not isinstance(payload, dict):
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "error_type": "validation_error",
+                        "message": "La petición debe contener un JSON válido.",
+                    }
+                ),
+                400,
+            )
 
-        rag_result = rag.generate_clinical_report(
-            caso_clinico=caso,
+        caso_clinico = payload.get("caso_clinico")
+        resultado_inferencia = payload.get("resultado_inferencia")
+
+        if not isinstance(caso_clinico, dict):
+            return (
+                jsonify(
+                    {
+                        "status": "error",
+                        "error_type": "validation_error",
+                        "message": "El campo caso_clinico es obligatorio y debe ser un objeto JSON.",
+                    }
+                ),
+                400,
+            )
+
+        paciente_id = caso_clinico.get("paciente_id")
+
+        result = rag.generate_clinical_report(
+            caso_clinico=caso_clinico,
+            resultado_inferencia=resultado_inferencia,
             paciente_id=paciente_id,
         )
 
-        response = {
-            "api_version": API_VERSION,
-            "status": "ok",
-            "generated_at": iso_now(),
-            "clinical_report": rag_result.get("clinical_report", {}),
-            "traceability": {
-                "sources": build_citations_from_sources(rag_result.get("sources", [])),
-                "warnings": rag_result.get("warnings", []),
-                "llm_used": rag_result.get("llm_used", False),
-                "llm_model": rag_result.get("llm_model"),
-                "fallback_reason": rag_result.get("fallback_reason"),
-                "paciente_id": paciente_id,
-            },
-        }
-
-        return jsonify(response), 200
+        return jsonify(result), 200
 
     except Exception as exc:
         return (
             jsonify(
-                build_error_response(
-                    code="CLINICAL_REPORT_ERROR",
-                    message=str(exc),
-                    api_version=API_VERSION,
-                )
+                {
+                    "status": "failed",
+                    "error_type": "internal_error",
+                    "message": "Error interno no controlado en el microservicio Flask/RAG.",
+                    "technical_detail": str(exc),
+                }
             ),
             500,
         )
@@ -252,4 +264,9 @@ def health():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=5001,
+        debug=True,
+        use_reloader=False,
+    )

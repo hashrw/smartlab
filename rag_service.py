@@ -1,6 +1,7 @@
 from __future__ import annotations
 from sql_service import SQLService
 
+import time
 import json
 import re
 from pathlib import Path
@@ -14,6 +15,7 @@ from llama_index.core.llms import MockLLM
 from llama_index.core.node_parser import TokenTextSplitter
 from llama_index.core.schema import Document
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from datetime import datetime, timezone
 
 try:
     from llama_index.retrievers.bm25 import BM25Retriever
@@ -42,6 +44,20 @@ except Exception:
 
 class RAGService:
 
+    def _capture_log(self, title: str, data: Dict[str, Any]) -> None:
+        """
+        Log compacto.
+        """
+        if not self.capture_logs:
+            return
+
+        print("\n" + "=" * 70)
+        print(f"[CAPTURA] {title}")
+        print("=" * 70)
+
+        for key, value in data.items():
+            print(f"{key}: {value}")
+
     # =========================================================================
     # Inicialización
     # =========================================================================
@@ -63,6 +79,7 @@ class RAGService:
         llm_timeout_seconds: int = 90,
         llm_max_context_sentences: int = 8,
         integration_mode: bool = True,
+        capture_logs: bool = True,
     ) -> None:
         self.data_dir = Path(data_dir)
         self.chunk_size = chunk_size
@@ -92,7 +109,7 @@ class RAGService:
         self.cross_encoder = None
         self.cross_encoder_enabled = False
         self.integration_mode = integration_mode
-
+        self.capture_logs = capture_logs
         self._initialize()
 
     def _initialize(self) -> None:
@@ -123,6 +140,21 @@ class RAGService:
             print(f"[RAG] cross_encoder_enabled={self.cross_encoder_enabled}")
             if self.cross_encoder_enabled:
                 print(f"[RAG] cross_encoder_model={self.cross_encoder_model_name}")
+
+        self._capture_log(
+            "Inicialización del corpus RAG",
+            {
+                "Directorio corpus": self.data_dir,
+                "Documentos cargados": len(self.documents),
+                "Fragmentos generados": len(self.nodes),
+                "Modelo de recuperación": self.embed_model_name,
+                "Recuperación híbrida activa": self.use_hybrid
+                and BM25_AVAILABLE
+                and FUSION_AVAILABLE,
+                "Reordenación cross-encoder activa": self.cross_encoder_enabled,
+                "Modo integración Laravel": self.integration_mode,
+            },
+        )
 
     # =========================================================================
     # Construcción del corpus e índice
@@ -177,6 +209,20 @@ class RAGService:
         if self.debug:
             print(f"[RAG] Documentos cargados (texto real): {len(documents)}")
 
+        if self.capture_logs and documents:
+            sample = documents[0].metadata
+
+            self._capture_log(
+                "Metadatos clínicos del corpus",
+                {
+                    "Archivo": sample.get("file_name"),
+                    "Bloque": sample.get("block"),
+                    "Tipo enfermedad": sample.get("diagnosis_type"),
+                    "Órgano": sample.get("organ"),
+                    "Categoría documental": sample.get("doc_category"),
+                    "Año": sample.get("year"),
+                },
+            )
         return documents
 
     def _normalize_document_text(self, documents: List[Document]) -> List[Document]:
@@ -629,6 +675,7 @@ class RAGService:
                 print("[DEBUG] cleaned_entries_count_for_llm:", len(cleaned_entries))
                 print("[DEBUG] sources_count_for_llm:", len(sources))
 
+            # revisar timeout
             llm_answer = self._call_llm(prompt)
 
             if self.debug:
@@ -681,6 +728,59 @@ class RAGService:
                 "paciente_id": paciente_id,
             }
 
+    def _normalize_clinical_report_error(self, exc: Exception) -> Dict[str, str]:
+        """
+        Normaliza errores técnicos del flujo LLM/RAG para no exponer trazas crudas
+        a Laravel ni a la interfaz médica.
+        """
+        raw = str(exc or "").strip()
+        lowered = raw.lower()
+
+        if "timed out" in lowered or "timeout" in lowered:
+            return {
+                "error_type": "llm_timeout",
+                "message": "No se ha podido generar el informe asistido porque el modelo LLM no respondió dentro del tiempo esperado.",
+                "technical_detail": raw,
+            }
+
+        if (
+            "urlerror" in lowered
+            or "connection refused" in lowered
+            or "failed to establish" in lowered
+        ):
+            return {
+                "error_type": "llm_unavailable",
+                "message": "No se ha podido generar el informe asistido porque el servicio LLM no está disponible.",
+                "technical_detail": raw,
+            }
+
+        if "no se pudo parsear" in lowered or "json" in lowered:
+            return {
+                "error_type": "llm_invalid_json",
+                "message": "No se ha podido generar el informe asistido porque la respuesta del modelo no tenía un formato estructurado válido.",
+                "technical_detail": raw,
+            }
+
+        if "respuesta vacía" in lowered or "respuesta vacia" in lowered:
+            return {
+                "error_type": "llm_empty_response",
+                "message": "No se ha podido generar el informe asistido porque el modelo devolvió una respuesta vacía.",
+                "technical_detail": raw,
+            }
+
+        if "contexto bibliográfico" in lowered or "empty_literature_context" in lowered:
+            return {
+                "error_type": "empty_literature_context",
+                "message": "No se ha podido generar el informe asistido porque no se obtuvo contexto bibliográfico suficiente.",
+                "technical_detail": raw,
+            }
+
+        return {
+            "error_type": "internal_error",
+            "message": "No se ha podido generar el informe asistido por un error interno controlado del microservicio.",
+            "technical_detail": raw,
+        }
+
     def generate_clinical_report(
         self,
         caso_clinico: Dict[str, Any],
@@ -691,9 +791,6 @@ class RAGService:
         Genera un informe clínico estructurado a partir del caso clínico recibido
         desde Laravel.
 
-        En este flujo de entrega:
-            - Laravel es la fuente de verdad clínica.
-            - Flask no consulta SQL.
             - El RAG usa el caso clínico para construir una consulta interna.
             - El LLM devuelve un informe estructurado en español.
         """
@@ -702,11 +799,19 @@ class RAGService:
             raise ValueError("caso_clinico debe ser un objeto JSON válido")
 
         retrieval_query = self._build_retrieval_query_from_case(caso_clinico)
+        self._capture_log(
+            "Caso clínico recibido y consulta generada",
+            {
+                "Paciente ID": paciente_id,
+                "Síntomas activos": caso_clinico.get("active_aliases_canonical", []),
+                "Órganos NIH": caso_clinico.get("organo_score_nih_by_nombre", {}),
+                "Consulta interna": retrieval_query,
+            },
+        )
 
-        raw_nodes = (
-            self._retrieve(retrieval_query)
-            if self.integration_mode
-            else self._retrieve_multiquery(retrieval_query)
+        raw_nodes = self._retrieve_clinical_report_case(
+            caso_clinico=caso_clinico,
+            base_query=retrieval_query,
         )
 
         cleaned_entries = self._postprocess_retrieved_nodes(
@@ -714,7 +819,43 @@ class RAGService:
             raw_nodes,
         )
 
+        self._capture_log(
+            "Selección final tras scoring y filtrado",
+            {
+                "Fragmentos candidatos tras postproceso": len(cleaned_entries),
+                "Órganos seleccionados": [
+                    (entry.get("meta", {}) or {}).get("organ")
+                    for entry in cleaned_entries
+                ],
+                "Archivos seleccionados": [
+                    (entry.get("meta", {}) or {}).get("file_name")
+                    for entry in cleaned_entries
+                ],
+                "Scores finales": [
+                    entry.get("final_score") for entry in cleaned_entries
+                ],
+            },
+        )
+
         sources = self._build_sources(cleaned_entries)
+
+        self._capture_log(
+            "Recuperación de evidencia científica",
+            {
+                "Fragmentos recuperados": len(raw_nodes),
+                "Fragmentos seleccionados": len(cleaned_entries),
+                "Fuentes seleccionadas": [
+                    {
+                        "archivo": source.get("file_name"),
+                        "bloque": source.get("block"),
+                        "órgano": source.get("organ"),
+                        "tipo": source.get("diagnosis_type"),
+                        "año": source.get("year"),
+                    }
+                    for source in sources[:5]
+                ],
+            },
+        )
 
         literature_context = self._build_llm_context(
             retrieval_query,
@@ -722,19 +863,26 @@ class RAGService:
         )
 
         if not literature_context.strip():
+            reason = "No se ha podido construir contexto bibliográfico suficiente."
+
             return {
-                "mode": "clinical_report",
+                "api_version": "v1",
+                "status": "ok",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
                 "clinical_report": self._fallback_clinical_report(
                     caso_clinico=caso_clinico,
-                    reason="No se ha podido construir contexto bibliográfico suficiente.",
+                    reason=reason,
                 ),
-                "sources": sources,
-                "warnings": [
-                    "No se ha podido construir contexto bibliográfico suficiente."
-                ],
-                "llm_used": False,
-                "fallback_reason": "empty_literature_context",
-                "paciente_id": paciente_id,
+                "traceability": {
+                    "llm_used": False,
+                    "llm_model": self.llm_model_name,
+                    "fallback_reason": reason,
+                    "error_type": "empty_literature_context",
+                    "technical_detail": "empty_literature_context",
+                    "sources": sources,
+                    "warnings": [reason],
+                    "paciente_id": paciente_id,
+                },
             }
 
         prompt = self._build_clinical_report_prompt(
@@ -746,33 +894,83 @@ class RAGService:
         try:
             llm_answer = self._call_llm(prompt)
 
+            self._capture_log(
+                "Respuesta cruda del LLM antes de parseo JSON",
+                {
+                    "Longitud respuesta": len(llm_answer or ""),
+                    "Inicio respuesta": (llm_answer or "")[:500],
+                    "Final respuesta": (llm_answer or "")[-500:],
+                    "Contiene apertura JSON": "{" in (llm_answer or ""),
+                    "Contiene cierre JSON": "}" in (llm_answer or ""),
+                },
+            )
+
             if not llm_answer.strip():
                 raise RuntimeError("El LLM devolvió una respuesta vacía")
 
             parsed_report = self._parse_clinical_report_json(llm_answer)
 
+            self._capture_log(
+                "Informe clínico generado correctamente",
+                {
+                    "LLM usado": True,
+                    "Modelo": self.llm_model_name,
+                    "Fuentes utilizadas": len(sources),
+                    "Título informe": parsed_report.get("titulo"),
+                    "Secciones principales": list(parsed_report.keys()),
+                },
+            )
+
             return {
-                "mode": "clinical_report",
+                "api_version": "v1",
+                "status": "ok",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
                 "clinical_report": parsed_report,
-                "sources": sources,
-                "warnings": [],
-                "llm_used": True,
-                "llm_model": self.llm_model_name,
-                "paciente_id": paciente_id,
+                "traceability": {
+                    "llm_used": True,
+                    "llm_model": self.llm_model_name,
+                    "fallback_reason": None,
+                    "error_type": None,
+                    "technical_detail": None,
+                    "sources": sources,
+                    "warnings": [],
+                    "paciente_id": paciente_id,
+                },
             }
 
         except Exception as exc:
+            normalized_error = self._normalize_clinical_report_error(exc)
+
+            self._capture_log(
+                "Informe generado en modo fallback",
+                {
+                    "LLM usado": False,
+                    "Tipo error": normalized_error["error_type"],
+                    "Mensaje funcional": normalized_error["message"],
+                    "Detalle técnico": normalized_error["technical_detail"],
+                    "Fuentes recuperadas": len(sources),
+                    "Paciente ID": paciente_id,
+                },
+            )
+
             return {
-                "mode": "clinical_report",
+                "api_version": "v1",
+                "status": "ok",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
                 "clinical_report": self._fallback_clinical_report(
                     caso_clinico=caso_clinico,
-                    reason=str(exc),
+                    reason=normalized_error["message"],
                 ),
-                "sources": sources,
-                "warnings": [str(exc)],
-                "llm_used": False,
-                "fallback_reason": str(exc),
-                "paciente_id": paciente_id,
+                "traceability": {
+                    "llm_used": False,
+                    "llm_model": self.llm_model_name,
+                    "fallback_reason": normalized_error["message"],
+                    "error_type": normalized_error["error_type"],
+                    "technical_detail": normalized_error["technical_detail"],
+                    "sources": sources,
+                    "warnings": [normalized_error["message"]],
+                    "paciente_id": paciente_id,
+                },
             }
 
     # helpers de clinical report
@@ -838,6 +1036,176 @@ class RAGService:
             + " ".join(score_terms)
         ).strip()
 
+    def _build_clinical_report_subqueries(
+        self,
+        caso_clinico: Dict[str, Any],
+        base_query: str,
+    ) -> List[str]:
+        """
+        Construye subconsultas para el informe clínico.
+
+        Regla principal:
+        - 1 query general de EICH aguda/crónica.
+        - 1 query específica por cada órgano afectado en el caso clínico.
+        """
+        sintomas = caso_clinico.get("active_aliases_canonical", []) or []
+        organos = caso_clinico.get("organo_score_nih_by_nombre", {}) or {}
+
+        alias_map = {
+            "o1_diarrea_acuosa": "watery diarrhea",
+            "o1_diarrea_con_sangre": "bloody diarrhea",
+            "o1_dolor_abdominal": "abdominal pain",
+            "o1_nauseas": "nausea",
+            "o1_vomitos": "vomiting",
+            "o1_anorexia": "anorexia",
+            "o2_alt_elevada": "elevated ALT",
+            "o2_fosfatasa_alcalina_elevada": "elevated alkaline phosphatase",
+            "o2_hiperbilirrubinemia": "hyperbilirubinemia",
+            "o7_exantema_maculopapular": "maculopapular rash",
+        }
+
+        organ_map = {
+            "Hígado": "liver",
+            "Higado": "liver",
+            "Tracto gastrointestinal": "gastrointestinal",
+            "Piel": "skin",
+            "Ojos": "ocular",
+            "Boca": "oral",
+            "Pulmón": "pulmonary",
+            "Pulmon": "pulmonary",
+            "Pulmones": "pulmonary",
+        }
+
+        organ_alias_prefix = {
+            "gastrointestinal": "o1_",
+            "liver": "o2_",
+            "skin": "o7_",
+        }
+
+        organ_query_terms = {
+            "gastrointestinal": "gastrointestinal manifestations diarrhea abdominal pain nausea vomiting gut involvement",
+            "liver": "liver hepatic involvement bilirubin jaundice hepatic dysfunction cholestasis alkaline phosphatase",
+            "skin": "skin cutaneous manifestations rash erythema maculopapular rash",
+            "ocular": "ocular manifestations eye dry eye keratoconjunctivitis",
+            "oral": "oral manifestations mouth mucosa oral lesions",
+            "pulmonary": "pulmonary manifestations lung bronchiolitis",
+        }
+
+        subqueries = [
+            "acute graft versus host disease clinical manifestations",
+        ]
+
+        for org, score in organos.items():
+            organ = organ_map.get(str(org), str(org)).lower()
+            prefix = organ_alias_prefix.get(organ)
+
+            symptom_terms = []
+            if prefix:
+                symptom_terms = [
+                    alias_map.get(alias, str(alias).replace("_", " "))
+                    for alias in sintomas
+                    if str(alias).startswith(prefix)
+                ]
+
+            organ_terms = organ_query_terms.get(
+                organ,
+                f"{organ} clinical manifestations",
+            )
+
+            subqueries.append(
+                (
+                    "acute graft versus host disease "
+                    f"{organ_terms} "
+                    + " ".join(symptom_terms)
+                    + f" {organ} NIH score {score}"
+                ).strip()
+            )
+
+        seen = set()
+        result = []
+
+        for query in subqueries:
+            normalized = re.sub(r"\s+", " ", query).strip()
+            key = normalized.lower()
+
+            if normalized and key not in seen:
+                seen.add(key)
+                result.append(normalized)
+
+        return result
+
+    def _retrieve_clinical_report_case(
+        self,
+        caso_clinico: Dict[str, Any],
+        base_query: str,
+    ):
+        """
+        Ejecuta retrieval para informe clínico usando:
+        - query general;
+        - query específica por órgano afectado.
+        """
+        if self.retriever is None:
+            raise RuntimeError("Retriever no inicializado")
+
+        subqueries = self._build_clinical_report_subqueries(
+            caso_clinico=caso_clinico,
+            base_query=base_query,
+        )
+
+        self._capture_log(
+            "Consulta multiquery para informe clínico",
+            {
+                "Número de consultas": len(subqueries),
+                "Consultas": subqueries,
+            },
+        )
+
+        merged = []
+        seen_ids = set()
+
+        for query in subqueries:
+            results = self._retrieve(query)
+
+            self._capture_log(
+                "Resultado retrieval por subconsulta",
+                {
+                    "Consulta": query,
+                    "Fragmentos recuperados": len(results),
+                    "Órganos recuperados": [
+                        (
+                            getattr(item.node, "metadata", {})
+                            if hasattr(item, "node")
+                            else getattr(item, "metadata", {})
+                        ).get("organ")
+                        for item in results[:10]
+                    ],
+                    "Archivos recuperados": [
+                        (
+                            getattr(item.node, "metadata", {})
+                            if hasattr(item, "node")
+                            else getattr(item, "metadata", {})
+                        ).get("file_name")
+                        for item in results[:10]
+                    ],
+                },
+            )
+
+            for item in results:
+                node = item.node if hasattr(item, "node") else item
+                node_id = (
+                    getattr(node, "node_id", None)
+                    or getattr(node, "id_", None)
+                    or id(node)
+                )
+
+                if node_id in seen_ids:
+                    continue
+
+                seen_ids.add(node_id)
+                merged.append(item)
+
+        return merged
+
     def _build_clinical_report_prompt(
         self,
         caso_clinico: Dict[str, Any],
@@ -898,6 +1266,9 @@ class RAGService:
                 Do not produce long paragraphs.
                 Use empty arrays when there is no information.
                 Use null when a scalar value is unknown.
+                Maximum 2 items per array.
+                Conclusion under 20 words.
+                Finish the JSON completely.
 
                 Required JSON structure:
 
@@ -908,7 +1279,6 @@ class RAGService:
                     "tipo_enfermedad": "",
                     "grado_eich": "",
                     "estado_injerto": "",
-                    "regla_aplicada": "",
                     "interpretacion": ""
                     }},
                     "justificacion_clinica": [
@@ -917,17 +1287,10 @@ class RAGService:
                     "score_nih": null,
                     "hallazgos_del_caso": [],
                     "relacion_con_eich": "",
-                    "nivel_alerta": "bajo"
+                    "nivel_alerta": ""
                     }}
                     ],
-                    "evidencia_cientifica": {{
-                    "resumen": "",
-                    "coherencia_con_el_caso": "",
-                    "incertidumbres": []
-                    }},
-                    "alertas_clinicas": [],
                     "limitaciones": [],
-                    "validacion_medica_recomendada": [],
                     "conclusion": ""
                 }}
 
@@ -945,15 +1308,33 @@ class RAGService:
         """
         Intenta parsear la respuesta del LLM como JSON.
         """
-        cleaned = llm_answer.strip()
+        cleaned = (llm_answer or "").strip()
 
         cleaned = re.sub(r"^```json", "", cleaned, flags=re.IGNORECASE).strip()
         cleaned = re.sub(r"^```", "", cleaned).strip()
         cleaned = re.sub(r"```$", "", cleaned).strip()
 
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+
+        if start == -1 or end == -1 or end <= start:
+            raise RuntimeError(
+                "No se pudo localizar un bloque JSON válido en la respuesta del LLM"
+            )
+
+        json_candidate = cleaned[start : end + 1]
+
         try:
-            parsed = json.loads(cleaned)
+            parsed = json.loads(json_candidate)
         except Exception as exc:
+            print("\n================ JSON PARSE ERROR DEBUG ================")
+            print("Error:", exc)
+            print("Respuesta completa del LLM:")
+            print(cleaned)
+            print("Candidato JSON extraído:")
+            print(json_candidate)
+            print("========================================================\n")
+
             raise RuntimeError(
                 f"No se pudo parsear el informe clínico como JSON: {exc}"
             )
@@ -998,27 +1379,11 @@ class RAGService:
                 "tipo_enfermedad": None,
                 "grado_eich": None,
                 "estado_injerto": None,
-                "regla_aplicada": None,
                 "interpretacion": "El DSS ha generado un caso clínico estructurado, pero la capa inteligente no ha podido completar la síntesis clínica.",
             },
             "justificacion_clinica": justificacion_clinica,
-            "evidencia_cientifica": {
-                "resumen": None,
-                "coherencia_con_el_caso": None,
-                "incertidumbres": [
-                    "No se ha podido completar la generación del informe con LLM.",
-                ],
-            },
-            "alertas_clinicas": [
-                "Revisar manualmente el diagnóstico inferido y los scores NIH asociados.",
-            ],
             "limitaciones": [
                 reason,
-            ],
-            "validacion_medica_recomendada": [
-                "Validar manualmente el caso clínico desde la información estructurada disponible.",
-                "Revisar síntomas activos y scores NIH por órgano.",
-                "Reintentar la generación del informe si el servicio LLM vuelve a estar disponible.",
             ],
             "conclusion": "Informe generado en modo fallback controlado. No debe considerarse informe clínico completo.",
         }
@@ -1279,6 +1644,34 @@ class RAGService:
             print("[DEBUG] retrieved_nodes_input_count:", len(retrieved_nodes))
 
         scored_entries: List[Dict[str, Any]] = []
+        self._capture_log(
+            "Resumen retrieval antes de scoring",
+            {
+                "Total nodos recuperados": len(retrieved_nodes),
+                "Órganos recuperados": [
+                    (
+                        getattr(
+                            item.node if hasattr(item, "node") else item,
+                            "metadata",
+                            {},
+                        )
+                        or {}
+                    ).get("organ")
+                    for item in retrieved_nodes
+                ],
+                "Archivos recuperados": [
+                    (
+                        getattr(
+                            item.node if hasattr(item, "node") else item,
+                            "metadata",
+                            {},
+                        )
+                        or {}
+                    ).get("file_name")
+                    for item in retrieved_nodes
+                ],
+            },
+        )
 
         for item in retrieved_nodes:
             node = item.node if hasattr(item, "node") else item
@@ -1334,9 +1727,43 @@ class RAGService:
             if self._is_valid_node(text, final_score):
                 scored_entries.append(entry)
 
+        self._capture_log(
+            "Resultado scoring antes de selección diversa",
+            {
+                "Nodos válidos tras scoring": len(scored_entries),
+                "Órganos válidos": [
+                    (entry.get("meta", {}) or {}).get("organ")
+                    for entry in scored_entries
+                ],
+                "Archivos válidos": [
+                    (entry.get("meta", {}) or {}).get("file_name")
+                    for entry in scored_entries
+                ],
+                "Scores válidos": [
+                    round(entry.get("final_score", 0.0), 4) for entry in scored_entries
+                ],
+            },
+        )
+
         scored_entries.sort(key=lambda x: x["final_score"], reverse=True)
 
         filtered = self._select_diverse_chunks(scored_entries, query)
+        self._capture_log(
+            "Resultado selección diversa final",
+            {
+                "Nodos finales": len(filtered),
+                "Órganos finales": [
+                    (entry.get("meta", {}) or {}).get("organ") for entry in filtered
+                ],
+                "Archivos finales": [
+                    (entry.get("meta", {}) or {}).get("file_name") for entry in filtered
+                ],
+                "Scores finales": [
+                    round(entry.get("final_score", 0.0), 4) for entry in filtered
+                ],
+            },
+        )
+
         if not filtered:
             filtered = scored_entries[:3]
 
@@ -1562,9 +1989,6 @@ class RAGService:
                 "erythema",
                 "cutaneous",
                 "pruritus",
-                "sclerotic",
-                "fibrotic",
-                "lichen",
             ],
             "gastrointestinal": [
                 "diarrhea",
@@ -1641,6 +2065,16 @@ class RAGService:
             if organ_meta in requested_organs:
                 markers = organ_manifestation_markers.get(organ_meta, [])
                 marker_hits = sum(1 for marker in markers if marker in lowered)
+                if self.debug and organ_meta == "skin":
+                    matched_markers = [
+                        marker for marker in markers if marker in lowered
+                    ]
+                    print(
+                        "[DEBUG] skin_markers:",
+                        matched_markers,
+                        "| file=",
+                        meta.get("file_name"),
+                    )
 
                 if marker_hits >= 3:
                     organ_symptom_bonus += 2.0
@@ -1716,42 +2150,84 @@ class RAGService:
 
     def _clinical_density_bonus(self, text: str) -> float:
         """
-        Bonificación por densidad de términos clínicos.
+        Bonificación por densidad de manifestaciones clínicas reales.
+        Penaliza chunks diagnósticos, terapéuticos o editoriales aunque mencionen piel/GVHD.
         """
         lowered = text.lower()
+
         clinical_terms = [
-            "manifestations",
+            "clinical manifestations",
             "clinical findings",
             "clinical features",
             "symptoms",
             "signs",
-            "skin",
             "rash",
             "erythema",
-            "liver",
-            "bilirubin",
-            "jaundice",
-            "gastrointestinal",
+            "maculopapular",
+            "morbilliform",
+            "pruritus",
+            "dry skin",
+            "scaly skin",
+            "desquamation",
+            "skin thickening",
+            "sclerosis",
+            "hyperpigmentation",
+            "hypopigmentation",
             "diarrhea",
             "abdominal pain",
             "nausea",
             "vomiting",
-            "oral",
-            "ocular",
-            "pulmonary",
-            "bronchiolitis obliterans",
-            "mouth",
+            "anorexia",
+            "bilirubin",
+            "jaundice",
+            "alkaline phosphatase",
+            "hepatic dysfunction",
             "dry eye",
+            "mouth lesions",
+            "oral lesions",
+            "bronchiolitis obliterans",
         ]
+
+        non_manifestation_terms = [
+            "biopsy",
+            "biopsies",
+            "histology",
+            "histologic",
+            "histological",
+            "interface dermatitis",
+            "vacuolar degeneration",
+            "dyskeratosis",
+            "management",
+            "treatment",
+            "therapy",
+            "phototherapy",
+            "photosensitivity",
+            "voriconazole",
+            "diagnosis",
+            "diagnostic",
+            "consensus recommendations",
+        ]
+
         hits = sum(1 for term in clinical_terms if term in lowered)
+        bad_hits = sum(1 for term in non_manifestation_terms if term in lowered)
+
+        score = -0.4
 
         if hits >= 8:
-            return 2.0
-        if hits >= 5:
-            return 1.2
-        if hits >= 3:
-            return 0.6
-        return -0.4
+            score = 2.0
+        elif hits >= 5:
+            score = 1.2
+        elif hits >= 3:
+            score = 0.6
+
+        if bad_hits >= 4:
+            score -= 2.0
+        elif bad_hits >= 2:
+            score -= 1.0
+        elif bad_hits == 1:
+            score -= 0.4
+
+        return score
 
     # bibliography_signals
     def _bibliography_signals(self, text: str) -> int:
@@ -1769,19 +2245,48 @@ class RAGService:
             "bibliography",
             "et al.",
             "doi:",
+            "doi.org",
             "pmid",
+            "pubmed",
             "biol blood marrow transplant",
             "bone marrow transplant",
+            "bonemarrowtransplant",
             "j clin oncol",
             "leukemia",
             "bbmt",
+            "author manuscript",
         ]
+
         for term in strong_terms:
             if term in lowered:
                 score += 1
 
         score += len(re.findall(r"\[\d+\]", text))
         score += len(re.findall(r"\b\d{4};\d{1,3}:\d{1,5}-\d{1,5}\b", text))
+
+        # Referencias compactadas por extracción PDF:
+        # BoneMarrowTransplant15:825–828
+        # BrMedJ2:1480
+        # JMolMed89:833
+        compact_journal_refs = re.findall(
+            r"\b[A-Z][A-Za-z]{2,}(?:J|Med|Transplant|Blood|Dermatol|Oncol)[A-Za-z]*\d{1,3}:\d{1,5}",
+            text,
+        )
+        score += len(compact_journal_refs) * 2
+
+        # Autores pegados: PrzepiorkaD,WeisdorfD,MartinPetal
+        compact_author_refs = re.findall(
+            r"\b[A-Z][a-z]+[A-Z](?:,?[A-Z][a-z]+[A-Z]){2,}",
+            text,
+        )
+        score += len(compact_author_refs) * 2
+
+        # Referencias numeradas tipo "31. Autor..."
+        numbered_refs = re.findall(r"\b\d{1,3}\.\s*[A-Z][A-Za-z]", text)
+        if len(numbered_refs) >= 2:
+            score += 3
+        elif len(numbered_refs) == 1:
+            score += 1
 
         author_like = len(re.findall(r"\b[A-Z][a-zA-Z\-']+\s+[A-Z]{1,3}\b", text))
         if author_like >= 8:
@@ -1865,20 +2370,23 @@ class RAGService:
             "clinical findings",
             "symptoms",
             "signs",
-            "skin",
             "rash",
             "erythema",
-            "gastrointestinal",
+            "maculopapular",
+            "pruritus",
             "diarrhea",
             "abdominal pain",
             "nausea",
             "vomiting",
-            "liver",
+            "anorexia",
             "bilirubin",
             "jaundice",
-            "oral",
-            "ocular",
-            "pulmonary",
+            "alkaline phosphatase",
+            "hepatic dysfunction",
+            "dry eye",
+            "mouth lesions",
+            "oral lesions",
+            "bronchiolitis obliterans",
         ]
 
         treatment_terms = [
@@ -1891,8 +2399,11 @@ class RAGService:
         ]
 
         intro_terms = [
+            "abstract",
             "introduction",
             "summary",
+            "background",
+            "review article",
             "important complication",
             "incidence",
             "prophylaxis",
@@ -1900,10 +2411,11 @@ class RAGService:
             "molecular biology",
             "etiopathogenesis",
             "update on",
+            "this article",
+            "this review",
         ]
 
         if any(x in t for x in differential_terms):
-            # solo diferencial si NO hay señal clínica real
             manifestation_hits = sum(1 for x in manifestation_terms if x in t)
 
             if manifestation_hits == 0:
@@ -1916,17 +2428,20 @@ class RAGService:
         if manifestation_hits >= 2:
             return "manifestations"
 
-        if treatment_hits >= 2 and manifestation_hits == 0 and intro_hits == 0:
-            return "treatment"
-
-        if intro_hits >= 1:
+        if intro_hits >= 1 and manifestation_hits == 0:
             return "intro"
+
+        if treatment_hits >= 2 and manifestation_hits == 0:
+            return "treatment"
 
         if manifestation_hits >= 1:
             return "manifestations"
 
         if treatment_hits >= 1:
             return "treatment"
+
+        if intro_hits >= 1:
+            return "intro"
 
         return "neutral"
 
@@ -2031,6 +2546,7 @@ class RAGService:
 
         return True
 
+    # is_valid_candidate temporal
     def _is_valid_candidate(
         self,
         entry: Dict[str, Any],
@@ -2049,30 +2565,87 @@ class RAGService:
         lowered = text.lower()
         chunk_intent = self._classify_chunk_intent_type(text)
 
-        if final_score < 0.0:
+        def reject(reason: str) -> bool:
+            if self.debug:
+                print(
+                    "[DEBUG] candidate_rejected:",
+                    reason,
+                    "| file=",
+                    meta.get("file_name"),
+                    "| block=",
+                    block,
+                    "| organ=",
+                    meta.get("organ"),
+                    "| diag_type=",
+                    diag_type,
+                    "| chunk_intent=",
+                    chunk_intent,
+                    "| final_score=",
+                    final_score,
+                    "| text=",
+                    text[:180],
+                )
             return False
+
+        table_noise_patterns = [
+            "table ",
+            "n (%)",
+            "clinical outcomes",
+            "abbreviations:",
+            "endoscopy data",
+            "esophagogastroduodenoscopy",
+            "ileocolonoscopy",
+        ]
+
+        has_table_noise = any(pattern in lowered for pattern in table_noise_patterns)
+
+        strong_clinical_terms = [
+            "diarrhea",
+            "diarrhoea",
+            "abdominal pain",
+            "nausea",
+            "vomiting",
+            "decreased appetite",
+            "weight loss",
+            "bilirubin",
+            "jaundice",
+            "alkaline phosphatase",
+            "ast",
+            "alt",
+        ]
+
+        has_strong_clinical_signal = any(
+            term in lowered for term in strong_clinical_terms
+        )
+
+        if has_table_noise and not has_strong_clinical_signal:
+            return reject("table_noise")
+
+        if final_score < 0.0:
+            return reject("negative_final_score")
 
         if self._looks_non_english_chunk(text):
-            return False
+            return reject("non_english_chunk")
 
         if wants_acute and diag_type == "chronic":
-            return False
+            return reject("acute_query_but_chronic_diagnosis")
 
         if wants_chronic and diag_type == "acute":
-            return False
+            return reject("chronic_query_but_acute_diagnosis")
 
         if block == "organ":
-            if wants_acute:
-                chronic_signals = [
-                    "chronic graft versus host disease",
-                    "chronic graft-versus-host disease",
-                    "cgvhd",
-                    "chronic gvhd",
-                    "sclerotic manifestations of chronic graft versus host disease",
-                    "fibrotic and sclerotic manifestations of chronic graft versus host disease",
-                ]
-                if any(signal in lowered for signal in chronic_signals):
-                    return False
+            # if wants_acute:
+            # chronic_signals = [
+            # "chronic graft versus host disease",
+            # "chronic graft-versus-host disease",
+            # "cgvhd",
+            # "chronic gvhd",
+            # "sclerotic manifestations of chronic graft versus host disease",
+            # "fibrotic and sclerotic manifestations of chronic graft versus host disease",
+            # ]
+
+            # if any(signal in lowered for signal in chronic_signals):
+            # return reject("acute_query_but_chronic_signal_in_organ_chunk")
 
             if wants_chronic:
                 acute_signals = [
@@ -2081,11 +2654,12 @@ class RAGService:
                     "agvhd",
                     "acute gvhd",
                 ]
+
                 if any(signal in lowered for signal in acute_signals):
-                    return False
+                    return reject("chronic_query_but_acute_signal_in_organ_chunk")
 
         if intent == "manifestations" and chunk_intent == "differential":
-            return False
+            return reject("manifestations_query_but_differential_chunk")
 
         if any(
             x in lowered
@@ -2096,7 +2670,7 @@ class RAGService:
                 "molecular tests",
             ]
         ):
-            return False
+            return reject("diagnostic_workup_noise")
 
         return True
 
@@ -2114,9 +2688,16 @@ class RAGService:
 
         return block == "diagnosis" and diag_type == target_diag
 
+    # select_diverse_chunks
     def _select_diverse_chunks(self, scored_entries, query: str):
         """
-        Selecciona una mezcla útil de evidencias.
+            Selecciona una mezcla útil de evidencias.
+
+            Criterio:
+        - Mantener diversidad por órgano.
+        - Permitir hasta 2 chunks por órgano para evitar que una tabla,
+          introducción o fragmento débil bloquee toda la evidencia del órgano.
+        - Limitar el contexto total a 4 chunks para no meter ruido excesivo.
         """
 
         q = query.lower()
@@ -2154,55 +2735,7 @@ class RAGService:
             if self._is_valid_candidate(entry, intent, wants_acute, wants_chronic)
         ]
 
-        if self.debug:
-            print("\n================ DIVERSE SELECTION INPUT DEBUG ================")
-            print("[DEBUG] query:", query)
-            print("[DEBUG] intent:", intent)
-            print("[DEBUG] wants_acute:", wants_acute)
-            print("[DEBUG] wants_chronic:", wants_chronic)
-            print("[DEBUG] target_diag:", target_diag)
-            print("[DEBUG] requested_organs:", requested_organs)
-            print("[DEBUG] scored_entries_count:", len(scored_entries))
-            print("[DEBUG] candidates_count:", len(candidates))
-
-            candidate_organs = [
-                ((entry.get("meta", {}) or {}).get("organ") or "None")
-                for entry in candidates
-            ]
-            print("[DEBUG] candidate_organs_raw:", candidate_organs)
-
-            for i, entry in enumerate(candidates[:10], 1):
-                meta = entry.get("meta", {}) or {}
-                print(f"[DEBUG] candidate[{i}] file_name:", meta.get("file_name"))
-                print(f"[DEBUG] candidate[{i}] block:", meta.get("block"))
-                print(
-                    f"[DEBUG] candidate[{i}] diagnosis_type:",
-                    meta.get("diagnosis_type"),
-                )
-                print(f"[DEBUG] candidate[{i}] organ:", meta.get("organ"))
-                print(f"[DEBUG] candidate[{i}] final_score:", entry.get("final_score"))
-
         if intent != "manifestations":
-            if self.debug:
-                print(
-                    "\n================ DIVERSE SELECTION NON-MANIFESTATIONS RETURN ================"
-                )
-                for i, entry in enumerate(candidates[:5], 1):
-                    meta = entry.get("meta", {}) or {}
-                    print(
-                        f"[DEBUG] return_candidate[{i}] file_name:",
-                        meta.get("file_name"),
-                    )
-                    print(f"[DEBUG] return_candidate[{i}] block:", meta.get("block"))
-                    print(
-                        f"[DEBUG] return_candidate[{i}] diagnosis_type:",
-                        meta.get("diagnosis_type"),
-                    )
-                print(f"[DEBUG] return_candidate[{i}] organ:", meta.get("organ"))
-                print(
-                    f"[DEBUG] return_candidate[{i}] final_score:",
-                    entry.get("final_score"),
-                )
             return candidates[:5]
 
         diagnosis_base: List[Dict[str, Any]] = []
@@ -2231,59 +2764,78 @@ class RAGService:
 
             supportive_neutral.append(entry)
 
-        if self.debug:
-            print("\n================ DIVERSE CLASSIFICATION DEBUG ================")
-            print("[DEBUG] diagnosis_base_count:", len(diagnosis_base))
-            print("[DEBUG] organ_manifestations_count:", len(organ_manifestations))
-            print("[DEBUG] supportive_neutral_count:", len(supportive_neutral))
-
-            organ_manifestation_organs = [
-                ((entry.get("meta", {}) or {}).get("organ") or "None")
-                for entry in organ_manifestations
-            ]
-            print("[DEBUG] organ_manifestation_organs_raw:", organ_manifestation_organs)
-
-            for i, entry in enumerate(diagnosis_base[:5], 1):
-                meta = entry.get("meta", {}) or {}
-                print(f"[DEBUG] diagnosis_base[{i}] file_name:", meta.get("file_name"))
-                print(
-                    f"[DEBUG] diagnosis_base[{i}] diagnosis_type:",
-                    meta.get("diagnosis_type"),
-                )
-                print(
-                    f"[DEBUG] diagnosis_base[{i}] final_score:",
-                    entry.get("final_score"),
-                )
-
-            for i, entry in enumerate(organ_manifestations[:10], 1):
-                meta = entry.get("meta", {}) or {}
-                print(
-                    f"[DEBUG] organ_manifestations[{i}] file_name:",
-                    meta.get("file_name"),
-                )
-                print(f"[DEBUG] organ_manifestations[{i}] organ:", meta.get("organ"))
-                print(
-                    f"[DEBUG] organ_manifestations[{i}] final_score:",
-                    entry.get("final_score"),
-                )
-
-            for i, entry in enumerate(supportive_neutral[:5], 1):
-                meta = entry.get("meta", {}) or {}
-                print(
-                    f"[DEBUG] supportive_neutral[{i}] file_name:", meta.get("file_name")
-                )
-                print(f"[DEBUG] supportive_neutral[{i}] block:", meta.get("block"))
-                print(
-                    f"[DEBUG] supportive_neutral[{i}] diagnosis_type:",
-                    meta.get("diagnosis_type"),
-                )
-                print(f"[DEBUG] supportive_neutral[{i}] organ:", meta.get("organ"))
-                print(
-                    f"[DEBUG] supportive_neutral[{i}] final_score:",
-                    entry.get("final_score"),
-                )
-
         result: List[Dict[str, Any]] = []
+        max_chunks_total = 4
+        max_chunks_per_organ = 2
+
+        def clinical_priority(entry):
+            text = (entry.get("text") or "").lower()
+            meta = entry.get("meta", {}) or {}
+            organ = (meta.get("organ") or "").lower()
+            score = float(
+                entry.get("final_score")
+                or entry.get("score")
+                or (entry.get("meta", {}) or {}).get("final_score")
+                or 0
+            )
+
+            liver_terms = [
+                "bilirubin",
+                "jaundice",
+                "ast",
+                "alt",
+                "alkaline phosphatase",
+                "cholestasis",
+                "liver dysfunction",
+                "hepatic dysfunction",
+            ]
+
+            gi_terms = [
+                "diarrhea",
+                "diarrhoea",
+                "abdominal pain",
+                "nausea",
+                "vomiting",
+                "bleeding",
+                "anorexia",
+                "weight loss",
+            ]
+
+            bonus = 0
+
+            if organ == "liver":
+                bonus += sum(2 for term in liver_terms if term in text)
+
+            if organ == "gastrointestinal":
+                bonus += sum(2 for term in gi_terms if term in text)
+
+            generic_penalty_terms = [
+                "introduction",
+                "allogeneic hematopoietic",
+                "department of",
+                "review article",
+                "all rights reserved",
+                "common complication",
+                "journal of gastrointestinal oncology",
+                "www.",
+                "confirm the diagnosis",
+                "exclusion of alternative diagnoses",
+                "nonspecific symptoms",
+                "should not develop gvhd",
+                "thalassemia",
+                "severe stunting",
+                "stunting",
+                "hypovolemic shock",
+                "kidney failure",
+                "clinical outcomes",
+                "septic shock",
+                "morbidity",
+                "mortality",
+            ]
+
+            penalty = sum(3 for term in generic_penalty_terms if term in text)
+
+            return score + bonus - penalty
 
         if requested_organs:
             specific_organ_chunks = [
@@ -2293,205 +2845,94 @@ class RAGService:
                 in requested_organs
             ]
 
+            specific_organ_chunks = sorted(
+                specific_organ_chunks,
+                key=clinical_priority,
+                reverse=True,
+            )
+
             if self.debug:
-                print(
-                    "\n================ SPECIFIC ORGAN SELECTION DEBUG ================"
-                )
-                print("[DEBUG] requested_organs:", requested_organs)
-                print(
-                    "[DEBUG] specific_organ_chunks_count:", len(specific_organ_chunks)
-                )
-
-                specific_organ_names = [
-                    ((entry.get("meta", {}) or {}).get("organ") or "None")
-                    for entry in specific_organ_chunks
-                ]
-                print("[DEBUG] specific_organ_chunks_organs_raw:", specific_organ_names)
-
+                print("\n================ DIVERSE PRIORITY DEBUG ================")
                 for i, entry in enumerate(specific_organ_chunks[:10], 1):
                     meta = entry.get("meta", {}) or {}
                     print(
-                        f"[DEBUG] specific_organ_chunk[{i}] file_name:",
+                        f"[DEBUG] priority[{i}]",
+                        "organ=",
+                        meta.get("organ"),
+                        "file=",
                         meta.get("file_name"),
-                    )
-                    print(
-                        f"[DEBUG] specific_organ_chunk[{i}] organ:", meta.get("organ")
-                    )
-                    print(
-                        f"[DEBUG] specific_organ_chunk[{i}] final_score:",
+                        "final_score=",
                         entry.get("final_score"),
+                        "score=",
+                        entry.get("score"),
+                        "meta_final_score=",
+                        meta.get("final_score"),
+                        "priority=",
+                        clinical_priority(entry),
+                        "text=",
+                        (entry.get("text") or "")[:180],
                     )
 
-            seen_organs = set()
+            organ_counts: Dict[str, int] = {}
+
             for entry in specific_organ_chunks:
                 organ = ((entry.get("meta", {}) or {}).get("organ") or "").lower()
-                key = organ or entry.get("meta", {}).get("file_name") or id(entry)
+                key = organ or "unknown"
 
-                if key in seen_organs:
+                current_count = organ_counts.get(key, 0)
+
+                if current_count >= max_chunks_per_organ:
                     continue
 
-                seen_organs.add(key)
-
                 if entry not in result:
                     result.append(entry)
+                    organ_counts[key] = current_count + 1
 
-                if self.debug:
-                    meta = entry.get("meta", {}) or {}
-                    print("\n================ RESULT BUILD DEBUG ================")
-                    print(
-                        "[DEBUG] added_specific_organ file_name:", meta.get("file_name")
-                    )
-                    print("[DEBUG] added_specific_organ organ:", meta.get("organ"))
-                    print("[DEBUG] current_result_count:", len(result))
-
-                if len(result) >= 4:
-                    if self.debug:
-                        print("\n================ FINAL RESULT DEBUG ================")
-                        for i, r in enumerate(result[:4], 1):
-                            meta = r.get("meta", {}) or {}
-                            print(
-                                f"[DEBUG] final_result[{i}] file_name:",
-                                meta.get("file_name"),
-                            )
-                            print(
-                                f"[DEBUG] final_result[{i}] block:", meta.get("block")
-                            )
-                            print(
-                                f"[DEBUG] final_result[{i}] diagnosis_type:",
-                                meta.get("diagnosis_type"),
-                            )
-                            print(
-                                f"[DEBUG] final_result[{i}] organ:", meta.get("organ")
-                            )
-                            print(
-                                f"[DEBUG] final_result[{i}] final_score:",
-                                r.get("final_score"),
-                            )
-                return result[:4]
-
-            if diagnosis_base:
-                if diagnosis_base[0] not in result:
-                    result.append(diagnosis_base[0])
-                    if self.debug:
-                        meta = diagnosis_base[0].get("meta", {}) or {}
-                        print("\n================ RESULT BUILD DEBUG ================")
-                        print(
-                            "[DEBUG] added_diagnosis_base file_name:",
-                            meta.get("file_name"),
-                        )
-                        print(
-                            "[DEBUG] added_diagnosis_base diagnosis_type:",
-                            meta.get("diagnosis_type"),
-                        )
-                        print("[DEBUG] current_result_count:", len(result))
-
-            if not specific_organ_chunks:
-                if self.debug:
-                    print(
-                        "\n================ SPECIFIC ORGAN FALLBACK DEBUG ================"
-                    )
-                    print(
-                        "[DEBUG] No specific organ chunks found for requested organs."
-                    )
-                    print("[DEBUG] requested_organs:", requested_organs)
-                    print("[DEBUG] diagnosis_base_kept_count:", len(result))
-                    for i, entry in enumerate(result[:10], 1):
-                        meta = entry.get("meta", {}) or {}
-                        print(
-                            f"[DEBUG] fallback_result[{i}] file_name:",
-                            meta.get("file_name"),
-                        )
-                        print(f"[DEBUG] fallback_result[{i}] block:", meta.get("block"))
-                        print(
-                            f"[DEBUG] fallback_result[{i}] diagnosis_type:",
-                            meta.get("diagnosis_type"),
-                        )
-                        print(f"[DEBUG] fallback_result[{i}] organ:", meta.get("organ"))
-                        print(
-                            f"[DEBUG] fallback_result[{i}] final_score:",
-                            entry.get("final_score"),
-                        )
-                return result[:6]
-
-            for entry in supportive_neutral:
-                if entry not in result:
-                    result.append(entry)
-                    if self.debug:
-                        meta = entry.get("meta", {}) or {}
-                        print("\n================ RESULT BUILD DEBUG ================")
-                        print(
-                            "[DEBUG] added_supportive_neutral file_name:",
-                            meta.get("file_name"),
-                        )
-                        print(
-                            "[DEBUG] added_supportive_neutral block:", meta.get("block")
-                        )
-                        print(
-                            "[DEBUG] added_supportive_neutral organ:", meta.get("organ")
-                        )
-                        print("[DEBUG] current_result_count:", len(result))
-                if len(result) >= 4:
+                if len(result) >= max_chunks_total:
                     break
 
-            if self.debug:
-                print("\n================ FINAL RESULT DEBUG ================")
-                for i, r in enumerate(result[:4], 1):
-                    meta = r.get("meta", {}) or {}
-                    print(
-                        f"[DEBUG] final_result[{i}] file_name:", meta.get("file_name")
-                    )
-                    print(f"[DEBUG] final_result[{i}] block:", meta.get("block"))
-                    print(
-                        f"[DEBUG] final_result[{i}] diagnosis_type:",
-                        meta.get("diagnosis_type"),
-                    )
-                    print(f"[DEBUG] final_result[{i}] organ:", meta.get("organ"))
-                    print(
-                        f"[DEBUG] final_result[{i}] final_score:", r.get("final_score")
-                    )
+            if diagnosis_base and len(result) < max_chunks_total:
+                if diagnosis_base[0] not in result:
+                    result.append(diagnosis_base[0])
 
-            return result[:4]
+            for entry in supportive_neutral:
+                if len(result) >= max_chunks_total:
+                    break
+
+                if entry not in result:
+                    result.append(entry)
+
+            return result[:max_chunks_total]
 
         if diagnosis_base:
             result.append(diagnosis_base[0])
 
-        seen_organs = set()
+        organ_counts: Dict[str, int] = {}
+
         for entry in organ_manifestations:
             organ = ((entry.get("meta", {}) or {}).get("organ") or "").lower()
-            key = organ or entry.get("meta", {}).get("file_name") or id(entry)
+            key = organ or "unknown"
 
-            if key in seen_organs:
+            current_count = organ_counts.get(key, 0)
+
+            if current_count >= max_chunks_per_organ:
                 continue
-
-            seen_organs.add(key)
 
             if entry not in result:
                 result.append(entry)
+                organ_counts[key] = current_count + 1
 
-            if len(result) >= 4:
+            if len(result) >= max_chunks_total:
                 break
 
         for entry in supportive_neutral:
+            if len(result) >= max_chunks_total:
+                break
+
             if entry not in result:
                 result.append(entry)
 
-            if len(result) >= 4:
-                break
-
-        if self.debug:
-            print("\n================ FINAL RESULT DEBUG ================")
-            for i, r in enumerate(result[:4], 1):
-                meta = r.get("meta", {}) or {}
-                print(f"[DEBUG] final_result[{i}] file_name:", meta.get("file_name"))
-                print(f"[DEBUG] final_result[{i}] block:", meta.get("block"))
-                print(
-                    f"[DEBUG] final_result[{i}] diagnosis_type:",
-                    meta.get("diagnosis_type"),
-                )
-                print(f"[DEBUG] final_result[{i}] organ:", meta.get("organ"))
-                print(f"[DEBUG] final_result[{i}] final_score:", r.get("final_score"))
-
-        return result[:4]
+        return result[:max_chunks_total]
 
     # =========================================================================
     # Construcción de contexto
@@ -2579,6 +3020,8 @@ class RAGService:
         query_lower = query.lower()
         context_blocks: List[str] = []
         used_sentences = 0
+        sentences_by_organ: Dict[str, int] = {}
+        max_sentences_per_organ = 2
 
         organ_focus_terms = {
             "skin": ["skin", "cutaneous", "rash", "erythema"],
@@ -2611,8 +3054,6 @@ class RAGService:
             "skin": [
                 "ocular",
                 "eye",
-                "mouth",
-                "oral",
                 "genital",
                 "vulvovaginal",
                 "balanitis",
@@ -2621,6 +3062,8 @@ class RAGService:
                 "vulva",
                 "vaginal",
                 "coronal sulcus",
+                "mouth",
+                "oral",
             ],
             "gastrointestinal": [
                 "ocular",
@@ -2719,13 +3162,35 @@ class RAGService:
 
                 sentence_lower = sentence.lower()
 
-                if "acute" in query_lower and (
-                    "chronic graft-versus-host disease" in sentence_lower
-                    or "chronic graft versus host disease" in sentence_lower
-                    or "cgvhd" in sentence_lower
-                    or "chronic gvhd" in sentence_lower
-                ):
+                non_report_context_terms = [
+                    "biopsy",
+                    "biopsies",
+                    "histology",
+                    "histologic",
+                    "histological",
+                    "histopathological",
+                    "interface dermatitis",
+                    "vacuolar degeneration",
+                    "dyskeratosis",
+                    "phototherapy",
+                    "photosensitivity",
+                    "voriconazole",
+                    "abbreviations",
+                    "endoscopy data",
+                    "esophagogastroduodenoscopy",
+                    "ileocolonoscopy",
+                ]
+
+                if any(term in sentence_lower for term in non_report_context_terms):
                     continue
+
+                # if "acute" in query_lower and (
+                # "chronic graft-versus-host disease" in sentence_lower
+                # or "chronic graft versus host disease" in sentence_lower
+                # or "cgvhd" in sentence_lower
+                # or "chronic gvhd" in sentence_lower
+                # ):
+                # continue
 
                 if "chronic" in query_lower and (
                     "acute graft-versus-host disease" in sentence_lower
@@ -2760,11 +3225,17 @@ class RAGService:
                     if has_disallowed_signal:
                         continue
 
-                if self.debug:
-                    print("[DEBUG] sentence_selected:", sentence)
+                    organ_key = organ or block or "unknown"
+
+                    if sentences_by_organ.get(organ_key, 0) >= max_sentences_per_organ:
+                        continue
+
+                    if self.debug:
+                        print("[DEBUG] sentence_selected:", sentence)
 
                 selected_sentences.append(sentence)
                 used_sentences += 1
+                sentences_by_organ[organ_key] = sentences_by_organ.get(organ_key, 0) + 1
 
             if self.debug:
                 print(
@@ -2803,7 +3274,6 @@ class RAGService:
 
         return final_context
 
-    # _extract_best_clinical_sentences_from_text
     # _extract_best_clinical_sentences_from_text
     def _extract_best_clinical_sentences_from_text(self, text: str) -> List[str]:
         """
@@ -2864,6 +3334,11 @@ class RAGService:
             "reviewed in this article",
             "in developing countries",
             "in developed countries",
+            "confirm the diagnosis",
+            "alternative diagnoses",
+            "coexisting pathologies",
+            "classic clinical features",
+            "exclusion of alternative diagnoses",
         ]
 
         for sentence in sentences:
@@ -2936,6 +3411,34 @@ class RAGService:
                 continue
 
             cleaned_lower = cleaned_sentence.lower()
+            table_like_sentence_markers = [
+                "n (%)",
+                "endoscopy data",
+                "esophagogastroduodenoscopy",
+                "ileocolonoscopy",
+                "abbreviations:",
+                "clinical outcomes",
+                "table ",
+                "staging and grading",
+            ]
+
+            # prueba caso leve
+            strong_skin_manifestations = [
+                "maculopapular rash",
+                "erythema",
+                "pruritus",
+            ]
+
+            if any(term in cleaned_lower for term in strong_skin_manifestations):
+                selected.append(cleaned_sentence)
+                continue
+
+            if any(marker in cleaned_lower for marker in table_like_sentence_markers):
+                if self.debug:
+                    print("[DEBUG] discard_reason: table_like_sentence")
+                    print("[DEBUG] TABLE SENTENCE FULL:")
+                    print(cleaned_sentence[:1500])
+                continue
 
             if any(cleaned_lower.startswith(prefix) for prefix in title_like_prefixes):
                 if self.debug:
@@ -3434,16 +3937,27 @@ class RAGService:
         """
         Llamada al LLM para Opción B.
         """
+        start = time.time()
         backend = (self.llm_backend or "").lower()
+        num_predict = 768
 
         if backend != "ollama":
             raise RuntimeError(f"LLM no soportado: {self.llm_backend}")
 
         url = f"{self.llm_base_url}/api/generate"
+        # payload = {
+        #    "model": self.llm_model_name,
+        #   "prompt": prompt,
+        #  "stream": False,
+        # }
         payload = {
             "model": self.llm_model_name,
             "prompt": prompt,
             "stream": False,
+            "options": {
+                "num_predict": num_predict,
+                "temperature": 0.1,
+            },
         }
 
         data = json.dumps(payload).encode("utf-8")
@@ -3460,6 +3974,7 @@ class RAGService:
                 print("[DEBUG] url:", url)
                 print("[DEBUG] model:", self.llm_model_name)
                 print("[DEBUG] timeout:", self.llm_timeout_seconds)
+                print("[DEBUG] prompt_length:", len(prompt or ""))
 
             with urllib_request.urlopen(
                 req, timeout=self.llm_timeout_seconds
@@ -3480,8 +3995,25 @@ class RAGService:
             raise RuntimeError(f"Error general llamando al LLM: {exc}") from exc
 
         answer = parsed.get("response", "")
-        if not isinstance(answer, str):
-            raise RuntimeError("Respuesta inválida del backend LLM")
+
+        if self.debug:
+            self._capture_log(
+                "Respuesta cruda del LLM antes de parseo JSON",
+                {
+                    "Longitud respuesta": len(answer or ""),
+                    "Empieza por": (answer or "")[:300],
+                    "Termina por": (answer or "")[-300:],
+                    "Contiene apertura JSON": "{" in (answer or ""),
+                    "Contiene cierre JSON": "}" in (answer or ""),
+                    "Modelo": self.llm_model_name,
+                    "num_predict": num_predict,
+                    "temperature": 0.1,
+                },
+            )
+
+            print("\n================ LLM RAW ANSWER ================")
+            print(answer)
+            print("================================================\n")
 
         return answer.strip()
 
@@ -3826,7 +4358,7 @@ if __name__ == "__main__":
         llm_backend="ollama",
         llm_base_url="http://localhost:11434",
         llm_model_name="mistral",
-        llm_timeout_seconds=90,
+        llm_timeout_seconds=300,
         llm_max_context_sentences=8,
     )
 
